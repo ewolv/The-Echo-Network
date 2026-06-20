@@ -69,7 +69,7 @@ class EchoLoginGUI:
             return
             
         auth_hash = hashlib.sha256(f"{user}:{pwd}".encode()).hexdigest()
-        self.launch_wallet(user, auth_hash)
+        self.launch_wallet(user, pwd, auth_hash)
 
     def attempt_register(self):
         user = self.reg_user.get().strip()
@@ -85,19 +85,20 @@ class EchoLoginGUI:
             
         messagebox.showinfo("Vault Created", f"Cryptographic vault generated for '{user}'.\n\nWelcome to the Echo Network.")
         auth_hash = hashlib.sha256(f"{user}:{pwd}".encode()).hexdigest()
-        self.launch_wallet(user, auth_hash)
+        self.launch_wallet(user, pwd, auth_hash)
 
-    def launch_wallet(self, username, auth_hash):
+    def launch_wallet(self, username, pwd, auth_hash):
         self.root.destroy()
         wallet_root = tk.Tk()
-        EchoMainWallet(wallet_root, username, auth_hash)
+        EchoMainWallet(wallet_root, username, pwd, auth_hash)
         wallet_root.mainloop()
 
 
 class EchoMainWallet:
-    def __init__(self, root, username, auth_hash):
+    def __init__(self, root, username, password, auth_hash):
         self.root = root
         self.username = username
+        self.password = password
         self.auth_hash = auth_hash
         
         # Define the Public Key BEFORE booting the core
@@ -106,9 +107,14 @@ class EchoMainWallet:
         self.root.title(f"Echo P2P Wallet - {self.username}")
         self.root.geometry("800x600")
         
-        # Initialize STARK Core using the PUBLIC KEY as the true identity
+        # Initialize STARK Core passing the GUI Password to the Keystore
         self.mesh = echo_core.MeshNetwork()
-        self.wallet = echo_core.EchoWallet(self.pub_key_display, self.mesh)
+        self.wallet = echo_core.EchoWallet(self.pub_key_display, self.mesh, vault_password=self.password)
+        
+        # ---> THE IGNITION SWITCH <---
+        # Read the JSON, find orphan funds, and encrypt the keys
+        self.wallet.load_orphan_genesis("original_orphan_echo.json")
+        
         self.selected_file_path = None
         
         # Ensure Downloads Folder Exists
@@ -166,6 +172,9 @@ class EchoMainWallet:
         self.tree_funds.column("Data / Purpose", width=200)
         self.tree_funds.pack(fill=tk.BOTH, expand=True)
 
+        # Automatically refresh dashboard on boot to show loaded orphans
+        self.refresh_dashboard()
+
     def copy_pub(self):
         self.root.clipboard_clear()
         self.root.clipboard_append(self.pub_key_display)
@@ -174,7 +183,6 @@ class EchoMainWallet:
     def attach_file(self):
         path = filedialog.askopenfilename()
         if path:
-            # Check file size to prevent memory overload in prototype (Limit: 5MB)
             if os.path.getsize(path) > 5 * 1024 * 1024:
                 messagebox.showerror("File Too Large", "For this prototype, please select a file under 5MB.")
                 return
@@ -197,20 +205,18 @@ class EchoMainWallet:
             messagebox.showerror("Error", "Invalid exponents.")
             return
 
-        # Native Phi File Transport Logic
         metadata_str = "Standard Transfer"
         if self.selected_file_path:
             try:
                 filename = os.path.basename(self.selected_file_path)
                 with open(self.selected_file_path, "rb") as f:
                     encoded_string = base64.b64encode(f.read()).decode('utf-8')
-                # Pack the file directly into the envelope's metadata
                 metadata_str = f"FILE:{filename}|B64:{encoded_string}"
             except Exception as e:
                 messagebox.showerror("File Error", f"Could not encode file:\n{e}")
                 return
 
-        # 1. Generate the STARK Envelope
+        # Generate the STARK Envelope
         env = self.wallet.make_payment(dest, exps, metadata=metadata_str)
         if not env:
             messagebox.showerror("Failed", "Insufficient funds or mathematical boundary error.")
@@ -218,7 +224,6 @@ class EchoMainWallet:
             
         env_dict = dataclasses.asdict(env)
         
-        # 2. Broadcast to the Global DigitalOcean Relay Tracker
         try:
             resp = requests.post(f"{NODE_URL}/network/broadcast", json=env_dict, timeout=10)
             if resp.status_code == 200:
@@ -235,11 +240,9 @@ class EchoMainWallet:
 
     def sync_network(self):
         try:
-            # Route strictly by the cryptographic public key, not the username alias
             resp = requests.get(f"{NODE_URL}/network/sync/{self.pub_key_display}", timeout=10)
             if resp.status_code == 200:
                 envelopes = resp.json().get("envelopes", [])
-                
                 download_count = 0
                 
                 for env_data in envelopes:
@@ -257,11 +260,10 @@ class EchoMainWallet:
                         fee_exps=tuple(env_data.get("fee_exps", [])), metadata=env_data.get("metadata", "")
                     )
                     
-                    # Force SPV Bypass
+                    # Process New Funds
                     if env.eid not in self.wallet.receipts:
                         self.wallet.envelopes[env.eid] = env
                         
-                        # --- DATA LAYER EXTRACTION ---
                         display_purpose = env.metadata
                         if env.metadata and env.metadata.startswith("FILE:"):
                             try:
@@ -269,7 +271,6 @@ class EchoMainWallet:
                                 filename = parts[0].replace("FILE:", "")
                                 b64_data = parts[1]
                                 
-                                # Rebuild the file physically on the hard drive
                                 save_path = os.path.join(self.download_dir, filename)
                                 with open(save_path, "wb") as f:
                                     f.write(base64.b64decode(b64_data))
@@ -280,11 +281,24 @@ class EchoMainWallet:
                                 display_purpose = "⚠️ File Extraction Failed"
                                 print(f"Extraction Error: {e}")
 
-                        class SPVReceipt:
-                            purpose = display_purpose
-                            exps = env.target_exps
-                            state = "LIVE"
-                        self.wallet.receipts[env.eid] = SPVReceipt()
+                        # DERIVE SPENDABLE KEYS FROM VAULT
+                        try:
+                            priv, pub = self.wallet.vault.create_or_unlock(master_seed=f"recv_{env.eid}", password=self.password)
+                            safe_pub = tuple(tuple(pair) for pair in pub)
+                            
+                            r = echo_core.Receipt(
+                                owner=self.pub_key_display,
+                                exps=env.target_exps,
+                                parent_id=env.parent_id,
+                                rid=env.eid,
+                                pub_key=safe_pub,
+                                priv_key=priv,
+                                state="LIVE",
+                                purpose=display_purpose
+                            )
+                            self.wallet.receipts[env.eid] = r
+                        except Exception as e:
+                            messagebox.showerror("Keystore Fault", f"Could not derive keys for {env.eid}\nError: {e}")
 
                 self.refresh_dashboard()
                 
